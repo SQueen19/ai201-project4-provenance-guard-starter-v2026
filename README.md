@@ -121,15 +121,45 @@
      two off the response, so leaving them out costs you next unit's
      diagnostics. -->
 
+*Milestone 3: signal one only. `style_score`, `confidence` and the label are
+still placeholders. The text is the plainly written stand-in paragraph from
+`PLANNING.md`.*
+
 ```bash
 $ curl -X POST http://127.0.0.1:5000/submit \
   -H "Content-Type: application/json" \
-  -d '{"text": "...", "creator_id": "..."}'
+  -d '{"text": "My name is Ana and I came to this city three years ago. At first it was hard for me. I did not know many people and my English was not good. I worked in a restaurant in the morning and I went to class in the evening. My teacher was very kind. She helped me with my writing and she told me to read every day. Now I can read books and I can talk with my neighbors. I am proud of this. I want to study nursing next year because I like to help people.", "creator_id": "sydelle"}'
 ```
 
 ```json
-
+{
+  "confidence": null,
+  "content_id": "7096d520-e928-4016-b36a-fc83abdb5496",
+  "creator_id": "sydelle",
+  "guess": "unsure",
+  "label": "PLACEHOLDER — the label arrives in Milestone 5.",
+  "model_score": 0.891,
+  "status": "decided",
+  "style_score": null
+}
 ```
+
+**A refused submission** (fewer than 50 words)
+
+```bash
+$ curl -X POST http://127.0.0.1:5000/submit \
+  -H "Content-Type: application/json" \
+  -d '{"text": "some writing", "creator_id": "sydelle"}'
+```
+
+```json
+{
+  "error": "text_too_short",
+  "message": "Text needs at least 50 words to judge fairly."
+}
+```
+
+HTTP 400.
 
 **An appeal**
 
@@ -150,7 +180,30 @@ $ curl "http://127.0.0.1:5000/log?limit=3"
 ```
 
 ```json
-
+{
+  "count": 2,
+  "entries": [
+    {
+      "combined_score": null,
+      "content_id": "7096d520-e928-4016-b36a-fc83abdb5496",
+      "creator_id": "sydelle",
+      "guess": "unsure",
+      "label": "PLACEHOLDER — the label arrives in Milestone 5.",
+      "model_score": 0.891,
+      "status": "decided",
+      "style_score": null,
+      "timestamp": "2026-10-26T01:58:00+00:00"
+    },
+    {
+      "creator_id": "sydelle",
+      "event": "rejected",
+      "http_status": 400,
+      "reason": "text_too_short",
+      "status": "rejected",
+      "timestamp": "2026-10-26T01:58:00+00:00"
+    }
+  ]
+}
 ```
 
 ---

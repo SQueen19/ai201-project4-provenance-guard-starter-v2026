@@ -1,0 +1,2 @@
+{"timestamp": "2026-10-26T01:58:00+00:00", "content_id": "7096d520-e928-4016-b36a-fc83abdb5496", "creator_id": "sydelle", "guess": "unsure", "model_score": 0.891, "style_score": null, "combined_score": null, "label": "PLACEHOLDER — the label arrives in Milestone 5.", "status": "decided"}
+{"timestamp": "2026-10-26T01:58:00+00:00", "creator_id": "sydelle", "event": "rejected", "status": "rejected", "reason": "text_too_short", "http_status": 400}
