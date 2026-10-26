@@ -30,8 +30,15 @@ from flask import Flask, jsonify, request
 
 import audit
 import config
+import detector
+import stylometry
 
 app = Flask(__name__)
+
+# Input limits for /submit — the contract in PLANNING.md.
+MIN_TEXT_WORDS = 50
+MAX_TEXT_CHARS = 10_000
+MAX_CREATOR_ID_CHARS = 64
 
 
 # ── Rate limiting — UNIT 8 ────────────────────────────────────────────────────
@@ -199,17 +206,67 @@ def submit():
     what should this do when `text` is missing, empty, or enormous? A crash on
     a malformed input is one of the most common real failures there is.
     """
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
 
-    # TODO: delete this and build the route.
+    # ── The input gate. Nothing below it sees text it can't judge honestly. ──
+    if not isinstance(payload, dict):
+        return _refuse(400, "invalid_json", "Send a JSON object with 'text' and 'creator_id'.")
+
+    text = payload.get("text")
+    creator_id = payload.get("creator_id")
+    creator = creator_id.strip() if isinstance(creator_id, str) else ""
+
+    for field, value in (("text", text), ("creator_id", creator_id)):
+        if not isinstance(value, str) or not value.strip():
+            return _refuse(400, "missing_field", f"'{field}' is required and can't be empty.", creator)
+    if len(creator) > MAX_CREATOR_ID_CHARS:
+        return _refuse(400, "missing_field", f"'creator_id' must be at most {MAX_CREATOR_ID_CHARS} characters.", creator)
+
+    text = text.strip()
+    if len(text) > MAX_TEXT_CHARS:
+        return _refuse(413, "text_too_long", f"Text must be at most {MAX_TEXT_CHARS:,} characters.", creator)
+    if len(stylometry.words(text)) < MIN_TEXT_WORDS:
+        return _refuse(400, "text_too_short", f"Text needs at least {MIN_TEXT_WORDS} words to judge fairly.", creator)
+
+    # ── Signal one ──
+    try:
+        model_score = detector.model_signal(text)
+    except detector.DetectorUnavailable:
+        return _refuse(503, "detector_unavailable", "The detector model isn't available. Try again later.", creator)
+
+    # Placeholders until Milestones 4 and 5: no second signal, no combining,
+    # no label. "unsure" is the honest guess while nothing has decided.
+    guess = "unsure"
+    label = "PLACEHOLDER — the label arrives in Milestone 5."
+
+    content_id = str(uuid.uuid4())
+
+    # Logged before the reply goes out: no decision exists without a record.
+    audit.log_decision(
+        content_id=content_id,
+        creator_id=creator,
+        guess=guess,
+        model_score=model_score,
+        label=label,
+        status="decided",
+    )
+
     return jsonify({
-        "error": "not_implemented",
-        "message": "POST /submit isn't built yet — see the TODO in app.py.",
-        "you_sent": {
-            "text_length": len(payload.get("text", "")),
-            "creator_id": payload.get("creator_id"),
-        },
-    }), 501
+        "content_id": content_id,
+        "creator_id": creator,
+        "guess": guess,
+        "confidence": None,
+        "label": label,
+        "model_score": model_score,
+        "style_score": None,
+        "status": "decided",
+    })
+
+
+def _refuse(status: int, error: str, message: str, creator_id: str = ""):
+    """Refuse a request, leaving a trace in the log. See PLANNING.md for the codes."""
+    audit.log_rejection(creator_id=creator_id or "unknown", reason=error, http_status=status)
+    return jsonify({"error": error, "message": message}), status
 
 
 @app.post("/appeal")
