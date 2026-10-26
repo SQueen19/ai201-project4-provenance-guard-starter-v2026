@@ -52,11 +52,19 @@ def combine_signals(model_score: float, style_score: float) -> float:
     The weights in config.py are placeholders. Change them, or ignore them and
     write a different rule.
     """
-    # TODO: replace this
-    return (
+    score = (
         config.WEIGHT_MODEL_SIGNAL * model_score
         + config.WEIGHT_STYLE_SIGNAL * style_score
     )
+
+    # When they split, the model signal doesn't get the last word. It can't
+    # tell a plain human writer from a machine, so "AI" needs the style signal
+    # to agree independently. Without that, the score stops just short of the
+    # AI threshold and the text lands in "unsure" at worst.
+    if style_score < config.STYLE_AGREEMENT:
+        score = min(score, config.AI_THRESHOLD - 0.0001)
+
+    return round(min(max(score, 0.0), 1.0), 4)
 
 
 def score_to_label(score: float) -> tuple[str, str]:
@@ -85,12 +93,29 @@ def score_to_label(score: float) -> tuple[str, str]:
     think if they got it on their own work. That question is the whole
     milestone.
     """
-    # TODO: replace this — thresholds are in config.py
     if score >= config.AI_THRESHOLD:
-        return "ai", "PLACEHOLDER — write the high-confidence AI label."
+        return "ai", LABEL_AI
     if score <= config.HUMAN_THRESHOLD:
-        return "human", "PLACEHOLDER — write the high-confidence human label."
-    return "unsure", "PLACEHOLDER — write the unsure label."
+        return "human", LABEL_HUMAN
+    return "unsure", LABEL_UNSURE
+
+
+# What a reader sees. No numbers and no jargon. The two that could land on
+# someone's own work say plainly that the check can be wrong and that a
+# review can be asked for.
+LABEL_HUMAN = "We think this was probably written by a person."
+
+LABEL_UNSURE = (
+    "We couldn't tell whether this was written by a person or by AI. "
+    "That isn't a judgement against the writer — a lot of people's own "
+    "writing lands here. If this is your work, you can ask for a review."
+)
+
+LABEL_AI = (
+    "Our check suggests this was probably written by AI. It's an automated "
+    "estimate, not proof, and it can be wrong — especially about plain or "
+    "formal writing. If you wrote this yourself, you can ask for a review."
+)
 
 
 def label_ranges() -> list[tuple[str, str]]:

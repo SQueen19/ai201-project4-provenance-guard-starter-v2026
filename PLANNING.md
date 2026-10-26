@@ -163,9 +163,12 @@ Every rejected request is logged with `audit.log_rejection`, including the
 | `style_score` | number | Signal two, 0–1, 4 dp, higher = more AI-like. |
 | `status` | string | Always `"decided"` on this endpoint. |
 
-**Label boundaries:** `confidence ≤ HUMAN_THRESHOLD` → `human`;
-`confidence ≥ AI_THRESHOLD` **and** `style_score ≥ 0.70` → `ai`; everything
-else → `unsure`. The thresholds live in `config.py`.
+**Label boundaries:** `confidence ≤ HUMAN_THRESHOLD` (0.30) → `human`;
+`confidence ≥ AI_THRESHOLD` (0.80) → `ai`; everything else → `unsure`. The
+style-agreement rule lives in `scoring.combine_signals`: when `style_score` is
+below 0.70, `confidence` is capped at 0.7999, so `ai` needs both signals to
+agree. In that case `confidence` is lower than the plain average of the two
+scores. All the numbers live in `config.py`.
 
 **Errors:**
 
