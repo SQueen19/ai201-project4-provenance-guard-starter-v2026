@@ -30,6 +30,7 @@ anything together:
     python stylometry.py "some text to look at"
 """
 
+import math
 import re
 import statistics
 
@@ -45,85 +46,127 @@ def words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9']+", text.lower())
 
 
-# ── The three measures — YOU BUILD THESE ─────────────────────────────────────
+# ── The three measures ───────────────────────────────────────────────────────
 
 def sentence_length_spread(text: str) -> float:
     """
-    How much sentence length varies. ← TODO
+    How much sentence length varies: stdev of words-per-sentence over the mean
+    (the coefficient of variation), so long and short texts are comparable.
 
     Returns:
-        A float. Decide yourself what scale it's on and which direction means
-        "more human" — then write that down, because your combining rule
-        depends on knowing it.
+        A float from 0 upward. **Higher means more human** — 0.1–0.25 on the
+        AI-style calibration texts, 0.38–1.2 on the human ones.
 
-    A hint on what you're reaching for: the standard deviation of sentence
-    lengths, probably divided by the mean so a long text and a short one are
-    comparable. `statistics.stdev` is imported for you.
-
-    Watch the edge case: a one-sentence submission has no spread at all, and
-    `stdev` raises on fewer than two values. Decide what that should return
-    before the attack set decides for you.
+    Fewer than two sentences returns 0.0: there's no spread to measure.
+    `style_signal` treats that as no evidence rather than as "perfectly even".
     """
-    # TODO: replace this
-    return 0.0
+    lengths = [n for n in (len(words(s)) for s in sentences(text)) if n]
+    if len(lengths) < 2:
+        return 0.0
+    return round(statistics.stdev(lengths) / statistics.mean(lengths), 4)
 
 
-def type_token_ratio(text: str) -> float:
+def type_token_ratio(text: str, window: int = 50) -> float:
     """
-    Unique words over total words. ← TODO
+    Unique words over total words, averaged over a sliding 50-word window.
 
     Returns:
-        A float between 0 and 1. Higher means more varied vocabulary.
+        A float between 0 and 1. **Higher means more varied vocabulary.**
 
-    Worth knowing before you rely on it: this measure falls as text gets
-    longer, because common words repeat. Two texts of different lengths aren't
-    directly comparable on it, and if your test inputs vary a lot in length,
-    that alone can look like a signal.
+    Plain TTR falls as text gets longer, so a 400-word essay would look less
+    varied than a 60-word one for no reason but length. Averaging over a fixed
+    window (moving-average TTR) takes length out of it. Texts shorter than
+    the window get plain TTR.
     """
-    # TODO: replace this
-    return 0.0
+    tokens = words(text)
+    if not tokens:
+        return 0.0
+    if len(tokens) <= window:
+        return round(len(set(tokens)) / len(tokens), 4)
+    ratios = [
+        len(set(tokens[i:i + window])) / window
+        for i in range(len(tokens) - window + 1)
+    ]
+    return round(statistics.mean(ratios), 4)
+
+
+# Full stops and commas are everywhere, in everyone's writing. These are the
+# marks that vary between writers: ; : — – ( ) ? ! and quotes, plus "--" and a
+# spaced " - " standing in for a dash.
+_EXPRESSIVE = re.compile(r"[;:\u2014\u2013()?!\"\u201c\u201d]|--|(?<=\s)-(?=\s)")
 
 
 def punctuation_density(text: str) -> float:
     """
-    How much punctuation, relative to length. ← TODO
+    Expressive punctuation marks per 100 words.
 
     Returns:
-        A float. Whether you count all punctuation or only some kinds — commas,
-        semicolons, dashes — is a real choice. Semicolons and em dashes are
-        more interesting than full stops, because they vary more between
-        writers.
+        A float from 0 upward. **Higher means more human.** Every AI-style
+        calibration text scored 0; the lively human ones scored 3–5.
     """
-    # TODO: replace this
-    return 0.0
+    tokens = words(text)
+    if not tokens:
+        return 0.0
+    return round(100 * len(_EXPRESSIVE.findall(text)) / len(tokens), 4)
 
 
 # ── Combining them ───────────────────────────────────────────────────────────
+# Each measure goes through a flipped logistic: at its midpoint it scores 0.5,
+# below it heads toward 1 (AI-like), above it toward 0. `scale` is how fast.
+# The midpoints sit between the AI-style and human calibration texts. They
+# were fitted to six stand-in paragraphs, so Milestone 4's real calibration
+# inputs should move them.
+
+SPREAD_MIDPOINT, SPREAD_SCALE = 0.35, 0.08
+TTR_MIDPOINT, TTR_SCALE = 0.78, 0.03
+PUNCT_MIDPOINT, PUNCT_SCALE = 1.5, 0.6
+
+# Spread separates best. Type-token ratio barely separates AI from human
+# (~0.80 vs ~0.86) but scores plain writers as very AI-like, so it counts least.
+WEIGHT_SPREAD = 0.5
+WEIGHT_PUNCT = 0.3
+WEIGHT_TTR = 0.2
+
+
+def _ai_likeness(value: float, midpoint: float, scale: float) -> float:
+    """Map a higher-is-more-human measure onto 0–1, higher = more AI-like."""
+    return 1.0 / (1.0 + math.exp((value - midpoint) / scale))
+
+
+def style_parts(text: str) -> dict[str, float]:
+    """Each measure's contribution on the 0–1 AI-likeness scale. For debugging."""
+    if len(sentences(text)) < 2:
+        spread_ai = 0.5   # one sentence: no evidence either way
+    else:
+        spread_ai = _ai_likeness(sentence_length_spread(text), SPREAD_MIDPOINT, SPREAD_SCALE)
+    return {
+        "spread": round(spread_ai, 4),
+        "punctuation": round(_ai_likeness(punctuation_density(text), PUNCT_MIDPOINT, PUNCT_SCALE), 4),
+        "vocabulary": round(_ai_likeness(type_token_ratio(text), TTR_MIDPOINT, TTR_SCALE), 4),
+    }
+
 
 def style_signal(text: str) -> float:
     """
-    The style signal as a 0–1 score. **Higher means more likely AI.** ← TODO
+    The style signal as a 0–1 score. **Higher means more likely AI.**
 
-    Combine your three measures into one number. Same direction as
-    `detector.model_signal`, so that `scoring.combine_signals` can treat them
-    the same way — if one of your signals runs backwards, everything above it
-    is wrong in a way that's hard to see.
+    A weighted average of the three measures, each first flipped and squashed
+    onto 0–1 so they point the same way and sit on the same scale:
 
-    Two things to decide and write down:
+        0.5 × spread  +  0.3 × punctuation  +  0.2 × vocabulary
 
-      1. Which direction each measure points. Low spread means more AI-ish, so
-         it needs flipping. Work out which of your three need that.
-      2. How to get each onto a comparable scale. A raw type-token ratio sits
-         between 0 and 1; a raw punctuation count doesn't. Adding them
-         unscaled means whichever has the bigger numbers wins by default.
-
-    Test it on the four calibration inputs from Milestone 4 — clearly AI,
-    clearly human, plain conventional human writing, lightly-edited AI — before
-    you trust it. Plain and ordinary, not formal: formal prose reads as *human*
-    to signal one, and it is plain writing that gets accused.
+    Blind spot: it can't read. A few dashes, a broken-up sentence or a pasted
+    quotation move it without changing a word of substance. And a plain writer
+    (even sentences, repeated everyday words, only full stops) looks AI-like on
+    all three measures at once.
     """
-    # TODO: replace this
-    return 0.5
+    parts = style_parts(text)
+    score = (
+        WEIGHT_SPREAD * parts["spread"]
+        + WEIGHT_PUNCT * parts["punctuation"]
+        + WEIGHT_TTR * parts["vocabulary"]
+    )
+    return round(min(max(score, 0.0), 1.0), 4)
 
 
 if __name__ == "__main__":
@@ -138,5 +181,5 @@ if __name__ == "__main__":
     print(f"sentence_length_spread   {sentence_length_spread(text)}")
     print(f"type_token_ratio         {type_token_ratio(text)}")
     print(f"punctuation_density      {punctuation_density(text)}")
+    print(f"  as AI-likeness         {style_parts(text)}")
     print(f"style_signal             {style_signal(text)}   (higher = more likely AI)")
-    print("\nAll zeros? These are stubs — Milestone 4 is where you build them.")
