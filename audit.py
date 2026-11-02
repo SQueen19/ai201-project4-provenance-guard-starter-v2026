@@ -27,6 +27,14 @@ import config
 
 _lock = threading.Lock()
 
+# The nine fields every entry carries — decisions, appeals and rejections
+# alike. A field that doesn't apply is null, never missing, so every line in
+# the log has the same shape and can be compared with any other.
+FIELDS = (
+    "timestamp", "content_id", "creator_id", "guess",
+    "model_score", "style_score", "combined_score", "label", "status",
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -58,8 +66,7 @@ def log_decision(
     Anything extra you pass gets written too — useful for `rejected` entries in
     unit 8, where there's no decision but you still want the trace.
     """
-    entry = {
-        "timestamp": _now(),
+    return _append({
         "content_id": content_id,
         "creator_id": creator_id,
         "guess": guess,
@@ -68,9 +75,8 @@ def log_decision(
         "combined_score": combined_score,
         "label": label,
         "status": status,
-    }
-    entry.update(extra)
-    return _append(entry)
+        **extra,
+    })
 
 
 def log_appeal(content_id: str, creator_id: str, reasoning: str) -> dict:
@@ -83,7 +89,6 @@ def log_appeal(content_id: str, creator_id: str, reasoning: str) -> dict:
     decided, that it was challenged, and in what order.
     """
     return _append({
-        "timestamp": _now(),
         "content_id": content_id,
         "creator_id": creator_id,
         "event": "appeal",
@@ -103,7 +108,6 @@ def log_rejection(creator_id: str, reason: str, **extra) -> dict:
     quiet afternoon.
     """
     return _append({
-        "timestamp": _now(),
         "creator_id": creator_id,
         "event": "rejected",
         "status": "rejected",
@@ -112,7 +116,13 @@ def log_rejection(creator_id: str, reason: str, **extra) -> dict:
     })
 
 
+def _complete(entry: dict) -> dict:
+    """The nine fields first, in order, null where they don't apply; extras after."""
+    return {**{field: entry.get(field) for field in FIELDS}, **entry}
+
+
 def _append(entry: dict) -> dict:
+    entry = _complete({"timestamp": _now(), **entry})
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False)
     with _lock:
@@ -137,11 +147,17 @@ def read_entries(limit: int | None = None) -> list[dict]:
         if not line:
             continue
         try:
-            entries.append(json.loads(line))
+            entry = json.loads(line)
         except json.JSONDecodeError:
             continue
+        # Rows written before every entry carried all nine fields are filled
+        # out on the way back, so readers never have to guess at the shape.
+        if isinstance(entry, dict):
+            entries.append(_complete(entry))
 
-    return entries[-limit:] if limit else entries
+    # A zero or negative limit means "everything": entries[-0:] happens to be
+    # the whole list, but entries[--5:] would silently drop the first five.
+    return entries[-limit:] if limit and limit > 0 else entries
 
 
 def clear() -> int:

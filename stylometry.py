@@ -139,9 +139,18 @@ def style_parts(text: str) -> dict[str, float]:
         spread_ai = 0.5   # one sentence: no evidence either way
     else:
         spread_ai = _ai_likeness(sentence_length_spread(text), SPREAD_MIDPOINT, SPREAD_SCALE)
+    # No expressive punctuation at all is no evidence either way. Plain writers
+    # use only full stops and commas as much as AI text does: in the unit 8
+    # eval, every text scored 0, human and AI alike, and each got the same
+    # 0.92 AI-likeness from it.
+    density = punctuation_density(text)
+    if density == 0:
+        punct_ai = 0.5
+    else:
+        punct_ai = _ai_likeness(density, PUNCT_MIDPOINT, PUNCT_SCALE)
     return {
         "spread": round(spread_ai, 4),
-        "punctuation": round(_ai_likeness(punctuation_density(text), PUNCT_MIDPOINT, PUNCT_SCALE), 4),
+        "punctuation": round(punct_ai, 4),
         "vocabulary": round(_ai_likeness(type_token_ratio(text), TTR_MIDPOINT, TTR_SCALE), 4),
     }
 
