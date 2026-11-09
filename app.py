@@ -20,10 +20,13 @@ Routes:
     POST /ping        the worked example. Already works. Don't edit it
     POST /submit      ← YOU BUILD THIS (Milestone 3, 4, 5)
     POST /appeal      ← YOU BUILD THIS (Milestone 5)
+    GET  /status/<id> one submission's decision, current status and appeals
     GET  /log         the audit log. Already works
+    GET  /runs        the run log: one timed record per request (runlog.py)
     GET  /health      is the service up, and is the model loaded
 """
 
+import time
 import uuid
 
 from flask import Flask, jsonify, request
@@ -31,16 +34,22 @@ from flask import Flask, jsonify, request
 import audit
 import config
 import detector
+import runlog
 import scoring
 import stylometry
 
 app = Flask(__name__)
+
+# Every request — success, refusal or crash — writes one timed record to
+# logs/runs.jsonl. See runlog.py.
+runlog.install(app)
 
 # Input limits for /submit — the contract in PLANNING.md.
 MIN_TEXT_WORDS = 50
 MAX_TEXT_CHARS = 10_000
 MAX_CREATOR_ID_CHARS = 64
 MAX_REASONING_CHARS = 2_000
+MAX_CONTENT_ID_CHARS = 64  # a uuid4 is 36; anything far longer isn't one of ours
 
 
 # ── Rate limiting — UNIT 8 ────────────────────────────────────────────────────
@@ -231,11 +240,22 @@ def submit():
         return _refuse(400, "text_too_short", f"Text needs at least {MIN_TEXT_WORDS} words to judge fairly.", creator)
 
     # ── The two signals, combined ──
+    # Was the model already in memory? The first run after a start pays to load it.
+    model_was_loaded = detector._model is not None
+    t0 = time.perf_counter()
     try:
         model_score = detector.model_signal(text)
     except detector.DetectorUnavailable:
+        runlog.note(model_was_loaded=model_was_loaded,
+                    detector_ms=round((time.perf_counter() - t0) * 1000, 1))
         return _refuse(503, "detector_unavailable", "The detector model isn't available. Try again later.", creator)
+    t1 = time.perf_counter()
+    # Noted before the next step, so a crash further down still records it.
+    runlog.note(model_was_loaded=model_was_loaded, detector_ms=round((t1 - t0) * 1000, 1))
+    if config.FAULT_INJECTION and request.headers.get("X-Inject-Fault") == "style":
+        raise RuntimeError("injected fault: style signal crashed (X-Inject-Fault test header)")
     style_score = stylometry.style_signal(text)
+    runlog.note(style_ms=round((time.perf_counter() - t1) * 1000, 1))
     combined_score = scoring.combine_signals(model_score, style_score)
 
     # The guess is real now; the label text is still a placeholder until
@@ -328,6 +348,50 @@ def appeal():
     })
 
 
+@app.get("/status/<content_id>")
+def status(content_id):
+    """
+    Where one submission stands now: its original decision, its current
+    status, and every appeal against it.
+
+        curl http://127.0.0.1:5000/status/<content_id>
+
+    Read straight from the audit log — no second copy of state that could
+    drift from it. The current status is the status of the latest entry for
+    the id, so an appealed item reads `under_review` and stays that way.
+    """
+    content_id = content_id.strip()
+    if not content_id or len(content_id) > MAX_CONTENT_ID_CHARS:
+        return _refuse(400, "invalid_content_id", "That doesn't look like a result ID. Check it and try again.")
+
+    entries = audit.entries_for(content_id)
+    decisions = [e for e in entries if e.get("status") == "decided"]
+    if not decisions:
+        return _refuse(404, "unknown_content_id", "We couldn't find a result with that ID. Check it and try again.")
+
+    decision = decisions[0]
+    appeals = [
+        {"timestamp": e["timestamp"], "reasoning": e.get("reasoning")}
+        for e in entries if e.get("event") == "appeal"
+    ]
+
+    return jsonify({
+        "content_id": content_id,
+        "creator_id": decision["creator_id"],
+        "status": entries[-1]["status"],
+        "decision": {
+            "decided_at": decision["timestamp"],
+            "guess": decision["guess"],
+            "label": decision["label"],
+            "confidence": decision["combined_score"],
+            "model_score": decision["model_score"],
+            "style_score": decision["style_score"],
+        },
+        "appeal_count": len(appeals),
+        "appeals": appeals,
+    })
+
+
 # ── Already works ─────────────────────────────────────────────────────────────
 
 @app.get("/log")
@@ -345,11 +409,24 @@ def get_log():
     return jsonify({"count": len(entries), "entries": entries})
 
 
+@app.get("/runs")
+def get_runs():
+    """
+    The run log — one timed record per request, most recent last.
+
+        curl "http://127.0.0.1:5000/runs?limit=10"
+    """
+    limit = request.args.get("limit", type=int)
+    runs = runlog.read_runs(limit=limit)
+    return jsonify({"count": len(runs), "runs": runs})
+
+
 def main():
     print(f"Provenance Guard on http://{config.HOST}:{config.PORT}")
     print(f"  detector model:  {config.DETECTOR_MODEL}")
     print(f"  rate limiting:   {'ON' if config.RATE_LIMITING_ENABLED else 'off (unit 8)'}")
     print(f"  audit log:       {config.AUDIT_LOG}")
+    print(f"  run log:         {config.RUN_LOG}")
     print()
     print("Check it's alive:")
     print(f'  curl -X POST http://{config.HOST}:{config.PORT}/ping \\')

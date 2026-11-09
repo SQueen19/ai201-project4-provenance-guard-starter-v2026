@@ -724,6 +724,244 @@ own 10 pieces.
 
 
 
+<!-- ═══════════════════════ UNIT 9 — THE EXTENSION ═══════════════════════ -->
+
+---
+
+## Instrumentation
+
+Every request the service handles writes one structured record to
+`logs/runs.jsonl` (`runlog.py`, installed in `app.py` with
+`runlog.install(app)`). This sits beside the audit log. The audit log records
+*decisions*; the run log records *runs*, meaning every request, how long it
+took, and whether it worked. Read it back with `GET /runs?limit=10` or
+`runlog.read_runs()`.
+
+| Field | What it holds |
+|---|---|
+| `timestamp` | UTC, to the millisecond |
+| `run_id` | 12-char id, also sent back in the `X-Run-Id` response header so a client can find its own record |
+| `method`, `path`, `http_status` | The request and the answer |
+| `outcome` | `ok` (2xx), `refused` (4xx: the service said no on purpose), `error` (5xx: something broke) |
+| `duration_ms` | Wall-clock time inside the service, request in to response out |
+| `cpu_ms` | CPU time the process used for this request, summed over all threads |
+| `input` | The request body. Long strings (the submitted text) are stored as length, word count, a 60-char preview and a SHA-256 prefix, not in full, so the run log isn't a second copy of everyone's writing |
+| `output` | The JSON response. Long labels are cut to 60 chars (the audit log keeps them in full); responses over 2 KB are summarised |
+| `error` | For a crash: exception type, message, and the file:line where it was raised |
+| `model_was_loaded` | `/submit` only: was gpt2 already in memory? `false` means this run paid to load it |
+| `detector_ms`, `style_ms` | `/submit` only: time spent in each signal |
+
+**Failures leave a record too.** The record is written in an `after_request`
+hook, so refusals (400, 404, 413) and rate-limit 429s are logged like any
+other answer. An unhandled exception is caught by an `errorhandler(Exception)`,
+written down with its type and location, and turned into a `500
+internal_error` reply instead of a dropped connection. The signal timings are
+noted as each signal finishes, so a crash part-way through `/submit` still
+records how far it got. `python check_failure_logging.py` checks this by
+sending five requests that fail in different ways. One of them injects a real
+exception into `stylometry.style_signal` for a single request. All five left a
+record with the right outcome (5/5).
+
+**Twelve entries from `logs/runs.jsonl`**, unedited. They cover a refused
+`/status` lookup, a route that doesn't exist, the injected crash, a cold-start
+submit, two warm submits, an appeal, the `/status` check after it, an empty
+text, a too-short text, an appeal with a typo'd id, and a 429:
+
+```jsonl
+{"timestamp": "2026-11-08T23:53:14.844+00:00", "run_id": "7be8988685fd", "method": "GET", "path": "/status/00000000-0000-0000-0000-000000000000", "http_status": 404, "outcome": "refused", "duration_ms": 36.7, "cpu_ms": 31.2, "input": null, "output": {"error": "unknown_content_id", "message": "We couldn't find a result with that ID. Check it and try again."}, "error": null}
+{"timestamp": "2026-11-08T23:53:14.883+00:00", "run_id": "dbcad5b573e9", "method": "GET", "path": "/nope", "http_status": 404, "outcome": "refused", "duration_ms": 0.6, "cpu_ms": 0.0, "input": null, "output": null, "error": null}
+{"timestamp": "2026-11-08T23:53:27.721+00:00", "run_id": "809de8e352bd", "method": "POST", "path": "/submit", "http_status": 500, "outcome": "error", "duration_ms": 12804.8, "cpu_ms": 10937.5, "input": {"creator_id": "failcheck_crash", "text": {"chars": 431, "words": 78, "preview": "The committee met on Tuesday and talked about the budget for", "sha256": "a9047c0454844ec5"}}, "output": {"error": "internal_error", "message": "Something went wrong on our side. It has been logged."}, "error": {"type": "ValueError", "message": "injected failure: style signal unavailable", "where": "check_failure_logging.py:40"}, "model_was_loaded": false, "detector_ms": 12802.4}
+{"timestamp": "2026-11-08T23:53:46.911+00:00", "run_id": "f76584a372b3", "method": "POST", "path": "/submit", "http_status": 200, "outcome": "ok", "duration_ms": 9769.7, "cpu_ms": 10828.1, "input": {"text": {"chars": 795, "words": 165, "preview": "I started walking to work last spring because the bus kept r", "sha256": "fce3c0996ebe22e1"}, "creator_id": "cost_175337_0"}, "output": {"confidence": 0.6521, "content_id": "28368c19-21a6-4060-bc1b-b1e109ecc8d5", "creator_id": "cost_175337_0", "guess": "unsure", "label": "We couldn't tell whether this was written by a person or by …", "model_score": 0.712, "status": "decided", "style_score": 0.5921}, "error": null, "model_was_loaded": false, "detector_ms": 9765.5, "style_ms": 1.2}
+{"timestamp": "2026-11-08T23:53:47.249+00:00", "run_id": "94021e3ae450", "method": "POST", "path": "/submit", "http_status": 200, "outcome": "ok", "duration_ms": 330.1, "cpu_ms": 1562.5, "input": {"text": {"chars": 795, "words": 165, "preview": "I started walking to work last spring because the bus kept r", "sha256": "fce3c0996ebe22e1"}, "creator_id": "cost_175337_1"}, "output": {"confidence": 0.6521, "content_id": "a8bd6920-e004-4c3e-b83b-9799f418eec5", "creator_id": "cost_175337_1", "guess": "unsure", "label": "We couldn't tell whether this was written by a person or by …", "model_score": 0.712, "status": "decided", "style_score": 0.5921}, "error": null, "model_was_loaded": true, "detector_ms": 326.2, "style_ms": 1.2}
+{"timestamp": "2026-11-08T23:53:47.671+00:00", "run_id": "06e60b8dcbc3", "method": "POST", "path": "/submit", "http_status": 200, "outcome": "ok", "duration_ms": 414.6, "cpu_ms": 1781.2, "input": {"text": {"chars": 795, "words": 165, "preview": "I started walking to work last spring because the bus kept r", "sha256": "fce3c0996ebe22e1"}, "creator_id": "cost_175337_2"}, "output": {"confidence": 0.6521, "content_id": "19c77059-6f67-4e8e-aeaa-73bc80bef278", "creator_id": "cost_175337_2", "guess": "unsure", "label": "We couldn't tell whether this was written by a person or by …", "model_score": 0.712, "status": "decided", "style_score": 0.5921}, "error": null, "model_was_loaded": true, "detector_ms": 411.2, "style_ms": 0.8}
+{"timestamp": "2026-11-08T23:54:01.112+00:00", "run_id": "727979dcb509", "method": "POST", "path": "/appeal", "http_status": 200, "outcome": "ok", "duration_ms": 7.6, "cpu_ms": 15.6, "input": {"content_id": "d5a08212-894c-492b-a1b8-a86471b814a5", "reasoning": "I wrote this on my phone on the walk home."}, "output": {"content_id": "d5a08212-894c-492b-a1b8-a86471b814a5", "message": "Your appeal has been recorded and this result is now under review.", "status": "under_review"}, "error": null}
+{"timestamp": "2026-11-08T23:54:01.226+00:00", "run_id": "edb4ad34bf7e", "method": "GET", "path": "/status/d5a08212-894c-492b-a1b8-a86471b814a5", "http_status": 200, "outcome": "ok", "duration_ms": 25.0, "cpu_ms": 0.0, "input": null, "output": {"appeal_count": 1, "appeals": [{"reasoning": "I wrote this on my phone on the walk home.", "timestamp": "2026-11-08T23:54:01+00:00"}], "content_id": "d5a08212-894c-492b-a1b8-a86471b814a5", "creator_id": "cost_175337_10", "decision": {"confidence": 0.6521, "decided_at": "2026-11-08T23:53:50+00:00", "guess": "unsure", "label": "We couldn't tell whether this was written by a person or by …", "model_score": 0.712, "style_score": 0.5921}, "status": "under_review"}, "error": null}
+{"timestamp": "2026-11-08T23:54:01.310+00:00", "run_id": "705cf335e9a7", "method": "POST", "path": "/submit", "http_status": 400, "outcome": "refused", "duration_ms": 1.8, "cpu_ms": 15.6, "input": {"text": "", "creator_id": "readme_demo"}, "output": {"error": "missing_field", "message": "'text' is required and can't be empty."}, "error": null}
+{"timestamp": "2026-11-08T23:54:01.418+00:00", "run_id": "3f80cd6eba56", "method": "POST", "path": "/submit", "http_status": 400, "outcome": "refused", "duration_ms": 3.1, "cpu_ms": 0.0, "input": {"text": "Only a few words here.", "creator_id": "readme_demo"}, "output": {"error": "text_too_short", "message": "Text needs at least 50 words to judge fairly."}, "error": null}
+{"timestamp": "2026-11-08T23:54:01.532+00:00", "run_id": "49aa6d455f3c", "method": "POST", "path": "/appeal", "http_status": 404, "outcome": "refused", "duration_ms": 19.3, "cpu_ms": 15.6, "input": {"content_id": "typo-1234", "reasoning": "This was mine."}, "output": {"error": "unknown_content_id", "message": "We couldn't find a result with that ID. Check it and try again."}, "error": null}
+{"timestamp": "2026-11-08T23:54:05.921+00:00", "run_id": "f9224880dc3b", "method": "POST", "path": "/submit", "http_status": 429, "outcome": "refused", "duration_ms": 2.2, "cpu_ms": 0.0, "input": {"text": {"chars": 795, "words": 165, "preview": "I started walking to work last spring because the bus kept r", "sha256": "fce3c0996ebe22e1"}, "creator_id": "flood_demo"}, "output": {"error": "rate_limited", "limit": "10 per 1 minute", "message": "Too many submissions. Try again shortly."}, "error": null}
+```
+
+---
+
+## What It Costs
+
+**One `/submit` costs about 0.40 seconds of wall-clock time and 1.7 seconds of
+CPU time** on this laptop on mains power, once the model is loaded. Three
+trials gave 404, 398 and 400 ms (`results/ext_eval_2026-11-08_2150_trial*.md`).
+The first submission after the service starts also pays a one-off cold start
+to load gpt2, measured between **9.8 s and 29.5 s** across runs.
+
+> **The first measurement, below, came out low.** The ten-run table below
+> (348 ms) is the first measurement, on battery. Later runs gave 793, 860
+> and 422 ms on battery, then 404, 398 and 400 ms on mains power. See
+> **Run Log — Extension**, criterion 9. I quote about 0.40 s because that's
+> what repeated.
+
+There's no API bill for this project. gpt2 runs locally, so the real cost is
+compute, and that's what I measured.
+
+| Measure (10 warm runs) | Mean | Std dev | Min | Max |
+|---|---|---|---|---|
+| Round trip (client) | 359.3 ms | 30.4 | 308.6 | 420.8 |
+| Wall time in service | 347.6 ms | 28.4 | 304.5 | 414.6 |
+| CPU time (all threads) | 1706.2 ms | 169.9 | 1328.1 | 1906.2 |
+| Signal one (gpt2) | 344.2 ms | 28.2 | 301.8 | 411.2 |
+| Signal two (stylometry) | 0.9 ms | 0.2 | 0.6 | 1.2 |
+
+Cold start (the run before these ten): 9,769.7 ms wall, 10,828.1 ms CPU,
+9,765.5 ms of it in gpt2.
+
+**How I measured it.** `python measure_cost.py` against a freshly started
+`python app.py`:
+
+1. It sends the same 165-word text to `/submit` ten times, with a different
+   `creator_id` each time so the rate limit never fires. The input is
+   identical, so the runs differ only in timing.
+2. The numbers come from the service's own timers: `time.perf_counter()` for
+   wall time and `time.process_time()` for CPU time, taken in `runlog.py` at
+   the start and end of each request and around each signal in
+   `app.py::submit`. The script reads each run's record back from `GET /runs`
+   using the `X-Run-Id` header, and also times the round trip from the client.
+3. The model wasn't loaded when it started, so the first request was the cold
+   start. It is reported separately and kept out of the average, because it
+   happens once per server start, not once per submission.
+4. Full output, with every run's `run_id`: `results/cost_2026-11-08_1753.md`.
+   Machine: Windows, Intel Core (8 logical CPUs), gpt2 on CPU, no GPU.
+
+**What the numbers say:**
+- **gpt2 is 99% of the cost.** Stylometry takes under a millisecond. Refused
+  requests cost 2–20 ms, because the input gate runs before the model, so bad
+  input and 429s are close to free.
+- **CPU time is about 5× wall time** because torch spreads one forward pass
+  across several cores. The real compute bill is about 1.7 CPU-seconds per
+  submission, not 0.35.
+- **Throughput.** On this machine one process can serve about 3 submissions a
+  second, one at a time.
+- **Caveat.** Windows reports CPU time in 15.6 ms steps, so single `cpu_ms`
+  values are coarse. The ten-run average smooths that out.
+
+---
+
+## Run Log — Extension Criteria
+
+Criteria 6–10 from `criteria.md`, run three separate times with
+`python run_extension_eval.py`. Each trial starts its **own fresh copy of the
+service** and stops it afterwards, so every trial has a real cold start and an
+empty rate limiter.
+
+The table below is the latest run (2026-11-08 21:50, laptop on mains power),
+made after fixing the criterion 8 miss:
+`results/ext_eval_2026-11-08_2150_trial1.md`, `…trial2.md`, `…trial3.md`,
+and `results/ext_run_log_2026-11-08_2150.md`. The two earlier runs that day
+(18:04 and 21:45, both before the fix) are kept unedited at the end of this
+section.
+
+**What each criterion ran to produce its number:**
+
+| # | What was run, each trial |
+|---|---|
+| 6 | 14 real submissions, appealed 0, 1 or 2 times in rotation; `/status` for each compared field by field with the `/submit` response |
+| 7 | Bad IDs sent on purpose: an unknown UUID, a real ID with one character changed, a 200-char ID (each **20 times**, so latency is a distribution of 60, not one number), and a real ID wrapped in spaces. Audit log and run log counted before and after every request |
+| 8 | A 20-request mixed batch: 10 good submits, then an 11th from the same writer to **trigger the rate limit**, 3 bad-input submits, `/status` real and unknown, an appeal, a missing route, `/ping`, and a `/submit` with a **crash injected** into signal two (`X-Inject-Fault: style`, only honoured when the server runs with `AI201_FAULT_INJECTION=1`) |
+| 9 | 1 cold + 10 warm submits of the same 165-word text against the freshly started server; timings read back from each request's own run-log record |
+| 10 | After the trial, `logs/runs.jsonl` scanned for the full text of all 15 texts sent, the longest string in any `input` field, and the largest record |
+
+| Criterion | Target | Run 1 | Run 2 | Run 3 | Verdict |
+|---|---|---|---|---|---|
+| 6. `/status` tells the truth | 14/14 status, count and decision fields match /submit | 14/14 (status 14/14, count 14/14) — **pass** | 14/14 (status 14/14, count 14/14) — **pass** | 14/14 (status 14/14, count 14/14) — **pass** | **Met** (all trials) |
+| 7. Bad `/status` refused, never crashes, logged | 4/4 cases right, 0 × 5xx, 1 audit + 1 run record each, every refusal < 100 ms | 4/4 cases, 0 × 5xx, p95 55 ms / max 64 ms (n=60) — **pass** | 4/4 cases, 0 × 5xx, p95 58 ms / max 64 ms (n=60) — **pass** | 4/4 cases, 0 × 5xx, p95 65 ms / max 68 ms (n=60) — **pass** | **Met** (all trials) |
+| 8. Every request leaves exactly one run record | 20 records for 20 requests, 20/20 run_id + outcome match, crash has error.type/where, 0 non-JSON | 20 records / 20 requests, 20/20 matched, 0 non-JSON — **pass** | 20 records / 20 requests, 20/20 matched, 0 non-JSON — **pass** | 20 records / 20 requests, 20/20 matched, 0 non-JSON — **pass** | **Met** (all trials) |
+| 9. Cost repeats, model loads once | mean warm wall < 450 ms and 296–400 ms, gpt2 ≥ 95%, exactly 1 cold start in 11 | 404 ms ±48, gpt2 98.6%, cold starts 1/11 — **FAIL** | 398 ms ±26, gpt2 98.9%, cold starts 1/11 — **pass** | 400 ms ±29, gpt2 99.1%, cold starts 1/11 — **FAIL** | **Missed** (2/3 trials failed) |
+| 10. Run log never stores writing | 0 full texts, no input string > 60 chars, every record < 3 KB | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | **Met** (all trials) |
+
+### Diagnosis, across all three runs
+
+**6 and 10 — Met in all nine trials.**
+
+**8 — Missed 3/3 in both earlier runs; met 3/3 after the fix.** The run log
+itself held in every trial: 20 records for 20 requests, every `run_id`
+matched its response header, every `outcome` matched its status class, and
+the injected crash was recorded with `error.type: "RuntimeError"` and the
+line it was raised on. The miss was the "0 non-JSON responses" part. A
+request to a route that doesn't exist (`GET /nope`) got Flask's built-in 404
+page, `text/html`.
+*Stage:* routing, before any of my handlers run. *Mechanism:* `runlog.py`'s
+`errorhandler(Exception)` passed `HTTPException`s through unchanged, so that
+real 404s and 405s wouldn't turn into 500s. Passing them through meant
+Werkzeug rendered its default HTML page.
+*Fix:* the handler now answers any HTTP error of 400 or above as
+`{"error": "not_found", "message": ...}` with its own status code. Redirects
+still pass through, and the 429 keeps its own handler. Checked with `GET
+/nope` (404 JSON), `GET /submit` and `DELETE /ping` (405 JSON), then
+`check_failure_logging.py` (5/5), then the full three-trial run above: 0
+non-JSON responses in every trial.
+
+**7 — Met 3/3 in the 18:04 and 21:50 runs, missed 2/3 in the 21:45 run.**
+Every correctness part held in all nine trials: 4/4 cases right, 0 × 5xx,
+exactly one audit entry and one run record per refused request. The 21:45
+misses were the 100 ms ceiling, broken by **one request out of 60** in each
+failing trial (108.2 ms and 107.4 ms; p95 41 and 67 ms).
+*Stage:* not the handler. *Mechanism:* the criterion was written expecting
+`/status` to slow down as the audit log grows, because it reads the whole log
+on every call. The data rules that out here, for three reasons.
+- The log grew from 835 to 1,460 entries between runs, yet the median
+  refusal got **faster**.
+- One spike was a 200-char ID, which is refused **before** the log is read.
+- The service's own timer for that trial maxed at 65.7 ms, so about 40 ms of
+  the spike was outside the handler, in the HTTP round trip and the
+  operating system.
+It was occasional scheduling delay on a busy laptop. On mains power (21:50)
+the slowest of 180 refusals was 68 ms.
+*Still worth watching:* the log-growth risk is real, just not here yet. The
+median is about 20–30 ms at roughly 1,500 entries.
+
+**9 — Missed in all three runs, by less each time. The "loads once" and
+"gpt2 ≥ 95%" parts held in all nine trials.** Mean warm wall time against a
+296–400 ms band (348 ± 15%):
+
+| Run | Power | Trial 1 | Trial 2 | Trial 3 |
+|---|---|---|---|---|
+| 18:04 | battery | 793 ms | 860 ms | 422 ms |
+| 21:45 | not recorded | 423 ms | 367 ms ✓ | 410 ms |
+| 21:50 | mains | 404.3 ms | 398 ms ✓ | 400.3 ms |
+
+*Stage:* signal one, gpt2's forward pass. It's about 99% of the time every
+trial; stylometry is about 1 ms. *Mechanism:* two things. First, on battery
+the laptop throttles the CPU, and a CPU-bound torch pass varies 2–2.5× from
+run to run (18:04, and a re-check in `results/cost_2026-11-08_1808_recheck.md`
+that gave 400 ± 156 ms). Second, once on mains power the spread collapsed
+(±26–48 ms) and all three trials landed at **about 400 ms**. So this
+machine's real warm cost is about 0.40 s, and the 348 ms I set the target
+around was a lucky first measurement. The latest misses are 4.3 ms and
+0.3 ms.
+*What I'm doing about it:* the target stays where it is. Moving it to fit
+the result after missing it is exactly what the course says not to do. What
+changes is the claim: **What It Costs** now quotes about 0.40 s, measured on
+mains power, instead of 0.35 s.
+
+---
+
+**Earlier run — 2026-11-08 21:45 (before the fix), unedited:**
+
+| Criterion | Target | Run 1 | Run 2 | Run 3 | Verdict |
+|---|---|---|---|---|---|
+| 6. `/status` tells the truth | 14/14 status, count and decision fields match /submit | 14/14 (status 14/14, count 14/14) — **pass** | 14/14 (status 14/14, count 14/14) — **pass** | 14/14 (status 14/14, count 14/14) — **pass** | **Met** (all trials) |
+| 7. Bad `/status` refused, never crashes, logged | 4/4 cases right, 0 × 5xx, 1 audit + 1 run record each, every refusal < 100 ms | 4/4 cases, 0 × 5xx, p95 41 ms / max 108 ms (n=60) — **FAIL** | 4/4 cases, 0 × 5xx, p95 56 ms / max 59 ms (n=60) — **pass** | 4/4 cases, 0 × 5xx, p95 67 ms / max 107 ms (n=60) — **FAIL** | **Missed** (2/3 trials failed) |
+| 8. Every request leaves exactly one run record | 20 records for 20 requests, 20/20 run_id + outcome match, crash has error.type/where, 0 non-JSON | 20 records / 20 requests, 20/20 matched, 1 non-JSON — **FAIL** | 20 records / 20 requests, 20/20 matched, 1 non-JSON — **FAIL** | 20 records / 20 requests, 20/20 matched, 1 non-JSON — **FAIL** | **Missed** (3/3 trials failed) |
+| 9. Cost repeats, model loads once | mean warm wall < 450 ms and 296–400 ms, gpt2 ≥ 95%, exactly 1 cold start in 11 | 423 ms ±44, gpt2 98.9%, cold starts 1/11 — **FAIL** | 367 ms ±65, gpt2 98.8%, cold starts 1/11 — **pass** | 410 ms ±68, gpt2 99.0%, cold starts 1/11 — **FAIL** | **Missed** (2/3 trials failed) |
+| 10. Run log never stores writing | 0 full texts, no input string > 60 chars, every record < 3 KB | 0/15 texts found, longest input 60 chars, largest record 803 B — **pass** | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | **Met** (all trials) |
+
+**Earlier run — 2026-11-08 18:04 (before the fix, on battery), unedited:**
+
+| Criterion | Target | Run 1 | Run 2 | Run 3 | Verdict |
+|---|---|---|---|---|---|
+| 6. `/status` tells the truth | 14/14 status, count and decision fields match /submit | 14/14 (status 14/14, count 14/14) — **pass** | 14/14 (status 14/14, count 14/14) — **pass** | 14/14 (status 14/14, count 14/14) — **pass** | **Met** (all trials) |
+| 7. Bad `/status` refused, never crashes, logged | 4/4 cases right, 0 × 5xx, 1 audit + 1 run record each, every refusal < 100 ms | 4/4 cases, 0 × 5xx, p95 59 ms / max 70 ms (n=60) — **pass** | 4/4 cases, 0 × 5xx, p95 66 ms / max 93 ms (n=60) — **pass** | 4/4 cases, 0 × 5xx, p95 42 ms / max 57 ms (n=60) — **pass** | **Met** (all trials) |
+| 8. Every request leaves exactly one run record | 20 records for 20 requests, 20/20 run_id + outcome match, crash has error.type/where, 0 non-JSON | 20 records / 20 requests, 20/20 matched, 1 non-JSON — **FAIL** | 20 records / 20 requests, 20/20 matched, 1 non-JSON — **FAIL** | 20 records / 20 requests, 20/20 matched, 1 non-JSON — **FAIL** | **Missed** (3/3 trials failed) |
+| 9. Cost repeats, model loads once | mean warm wall < 450 ms and 296–400 ms, gpt2 ≥ 95%, exactly 1 cold start in 11 | 793 ms ±70, gpt2 99.0%, cold starts 1/11 — **FAIL** | 860 ms ±37, gpt2 99.1%, cold starts 1/11 — **FAIL** | 422 ms ±86, gpt2 98.4%, cold starts 1/11 — **FAIL** | **Missed** (3/3 trials failed) |
+| 10. Run log never stores writing | 0 full texts, no input string > 60 chars, every record < 3 KB | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | 0/15 texts found, longest input 60 chars, largest record 804 B — **pass** | **Met** (all trials) |
+
 <!-- ═════════════════════════════════════════════════════════════════════
 
      SUBMISSION CHECKLIST — unit 7

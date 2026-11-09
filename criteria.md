@@ -167,3 +167,136 @@ see.
      A number you missed stays where it is, gets diagnosed, and gets a fix
      attempted. That's where the points are.
      ───────────────────────────────────────────────────────────────────────── -->
+
+---
+
+# Unit 9 — criteria for the extension
+
+The extension is two things built on top of the working service:
+`GET /status/<content_id>` (one submission's decision, status and appeals) and
+the run log (`runlog.py`: one timed record per request, failures included),
+along with the cost measurement that reads from it. All five criteria below are
+about those new parts. Criteria 1–5 above stay as they were.
+
+Baseline numbers come from the runs on 2026-11-08:
+`results/status_check_2026-11-08_1731.md` and
+`results/cost_2026-11-08_1753.md`.
+
+---
+
+## 6. `/status` tells the truth about every submission
+
+For the 14 submissions `run_status_check.py` sends, appealed 0, 1 or 2 times
+in rotation (5, 5 and 4 of them), `GET
+/status/<content_id>` reports **the right `status` in 14 of 14**
+(`decided` with no appeal, `under_review` after one or more), **the right
+`appeal_count` in 14 of 14**, and a `decision` block whose `guess`, `label`,
+`confidence`, `model_score` and `style_score` are **exactly equal** to what
+`/submit` returned for that ID. It must hold in every one of the three trials.
+Measured by `run_status_check.py`.
+
+**Why this target:** `/status` is where a writer goes to find out whether
+their appeal counted. If it says `decided` after they appealed, they'll assume
+they were ignored, or appeal again and inflate the count. If it shows a
+different label from the one they were given, they can't trust either one.
+The endpoint does no scoring; it only reads the audit log back. Nothing
+random sits between the log and the answer, so anything short of 14 of 14
+means a bug in how I read the log, not noise. The 0/1/2-appeal rotation is
+there because "only the first appeal is counted" and "only the latest entry
+is read" are both bugs a single appeal would hide.
+
+---
+
+## 7. A bad `/status` request is refused, never crashes, and is logged
+
+Each of these 4 requests gets the listed status and `error` code, **with zero
+500s**, **exactly one `rejected` entry in the audit log** and **exactly one
+run-log record with `outcome: "refused"`** each, in every one of the three
+trials:
+
+| Request | Expected |
+|---|---|
+| A well-formed UUID that was never submitted | 404 `unknown_content_id` |
+| A real ID with one character changed | 404 `unknown_content_id` |
+| A 200-character ID | 400 `invalid_content_id` |
+| A real ID with spaces around it (`%20<id>%20`) | 200, the same answer as the clean ID |
+
+Each refused request also answers in **under 100 ms** with the audit log at its
+current size (737 entries).
+
+**Why this target:** This is the bad path for the new endpoint, and the typo
+case matters most. A writer copying an ID out of an email is the most likely
+person to send one, and a 200 with someone else's result, or a 500, are both
+worse than a clear 404. The spaces case is the opposite mistake: refusing a
+real ID because of stray whitespace looks to the writer like their result has
+vanished. The 100 ms limit isn't about speed for its own sake. `/status`
+reads the *whole* audit log on every call (`audit.entries_for`), so its time
+grows with the log. Today it answers in 25–43 ms. If it goes past 100 ms, the
+log has outgrown that approach and the lookup needs an index. I want the
+criterion to tell me when that happens, not a writer.
+
+---
+
+## 8. Every request leaves exactly one run-log record, including the ones that fail
+
+Across a mixed batch of 20 requests (10 good `/submit`s, 3 bad-input
+`/submit`s, 1 that hits the rate limit, 2 `/status` lookups, 1 `/appeal`, 1
+request to a route that doesn't exist, 1 `/ping`, and 1 `/submit` with a crash
+injected into a signal), `logs/runs.jsonl` gains **exactly 20 records**. Every
+record's `run_id` matches the `X-Run-Id` header of its response, and every
+`outcome` matches its status class (`ok` / `refused` / `error`): **20 of 20**.
+The crash record has a non-null `error.type` and `error.where`, and **0** of
+the 20 responses is a dropped connection or an HTML error page. It must hold
+in every one of the three trials.
+
+**Why this target:** A failure that shows up only as an absence is one I'll
+never find, so the failures are what this criterion is mostly testing. One
+missing record isn't 95% good. It means some kind of failure leaves no trace,
+and I can't know which kind. The count has to be exact in both directions. A
+request that writes *two* records (for example, if the crash handler and the
+after-request hook both wrote) would double-count failures and make the
+system look worse than it is. The crash has to be injected because a healthy
+service never produces a 500 on its own, and an error path that has never
+run is not one I can claim works.
+
+---
+
+## 9. The cost number is repeatable, and the model loads once
+
+Across **three runs of `measure_cost.py`**, each against a freshly started
+service:
+
+- the mean warm wall time per `/submit` is **under 450 ms** in every run and
+  **within ±15% of 348 ms** (296–400 ms);
+- gpt2 accounts for **at least 95%** of that wall time;
+- **exactly 1 of the 11** `/submit` records in each run has
+  `model_was_loaded: false` (the cold start). The other 10 have `true`.
+
+**Why this target:** A cost number is only worth writing down if measuring it
+again gives roughly the same answer. Within one run the spread was ±28 ms
+(about 8%), so ±15% leaves room for ordinary noise on a laptop. It still
+catches a real change, such as another process taking the CPU or someone
+raising `DETECTOR_MAX_TOKENS`. The "loads once" part is there because the most
+expensive bug this service can have is reloading gpt2 on every request. That
+turns 0.35 s into 10 s per submission, about 28× the cost. The 95% share
+checks my claim that the model *is* the cost. If stylometry or logging ever
+takes more than a few percent, that's a regression I want to see.
+
+---
+
+## 10. The run log never stores anyone's writing
+
+For the 14 texts sent by `run_status_check.py` and the text sent by
+`measure_cost.py`, **0** of them appear in full in `logs/runs.jsonl`. No
+`input` field holds more than **60 characters** of any submitted text, and
+**every record is under 3 KB**.
+
+**Why this target:** The run log is committed to a public repository
+alongside the audit log. Writers submit their work to be judged, not
+published. Copying the full text into a second file that nobody reviews
+would be a quiet leak that's hard to undo once pushed. Sixty characters is
+enough to recognise a submission while debugging, and the hash is enough to
+match it exactly. The 3 KB cap keeps the log readable and its growth
+predictable. At about 1 KB per `/submit`, 200 submissions a day (the rate
+limit's daily cap per writer) is a few hundred KB, not megabytes of copied
+essays.

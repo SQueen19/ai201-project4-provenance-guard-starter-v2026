@@ -109,8 +109,17 @@ RATE_LIMIT_PER_DAY = 200
 RATE_LIMIT_STORAGE = "memory://"
 
 
+# ─── Fault injection (testing only) ──────────────────────────────────────────
+# Off unless AI201_FAULT_INJECTION=1. When on, a /submit carrying the header
+# `X-Inject-Fault: style` crashes inside signal two, so the error path can be
+# tested against the real running service. run_extension_eval.py turns it on
+# for the server it starts; nothing else should.
+FAULT_INJECTION = os.getenv("AI201_FAULT_INJECTION", "0") == "1"
+
+
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
 LOG_DIR = ROOT / "logs"
 AUDIT_LOG = LOG_DIR / "audit.jsonl"
+RUN_LOG = LOG_DIR / "runs.jsonl"     # one record per request: timing, input, output, errors (runlog.py)
 RESULTS_DIR = ROOT / "results"

@@ -68,7 +68,7 @@ sent it data, it sent something back.
 `/ping` still answers: if it does, the problem is in your handler; if it
 doesn't, it's the service itself, and that's a help-channel question.
 
-Then try the route you're going to build:
+Then try the real route:
 
 ```bash
 curl -X POST http://127.0.0.1:5000/submit \
@@ -76,8 +76,12 @@ curl -X POST http://127.0.0.1:5000/submit \
   -d '{"text": "some writing", "creator_id": "me"}'
 ```
 
-It returns a `501` saying it isn't built yet. **That's the correct starting
-position.**
+That text is too short to judge, so it returns `400 text_too_short`. The input
+gate wants at least 50 words. Send 50 or more and you get back a
+`content_id`, a `guess` (`human`, `ai` or `unsure`), a `confidence`, the
+`label` a reader would see, and both signal scores. The first one takes about
+10 seconds while gpt2 loads; after that each one takes about a third of a
+second.
 
 ---
 
@@ -88,8 +92,10 @@ position.**
 | `POST /ping` | **works** | The example. Don't edit it |
 | `GET /health` | **works** | Is the service up, is the model loaded |
 | `GET /log` | **works** | The audit log, as JSON |
-| `POST /submit` | **you build it** | Milestones 3, 4, 5 |
-| `POST /appeal` | **you build it** | Milestone 5 |
+| `POST /submit` | **works** | Scores text with both signals, labels it, logs the decision |
+| `POST /appeal` | **works** | Moves a decision to `under_review` and logs the appeal |
+| `GET /runs` | **works** — unit 9 | The run log: one timed record per request, failures included |
+| `GET /status/<content_id>` | **works** — unit 9 extension | One submission's decision, current status and appeals |
 
 ---
 
@@ -105,6 +111,10 @@ position.**
 | `python run_attacks.py --set <folder>` | The attack set — **unit 8** |
 | `python run_attacks.py --flood 15` | Push past your rate limit and print the status codes — **unit 8** |
 | `python run_eval.py --label before` | Your five criteria, three trials — **unit 8** |
+| `python run_status_check.py` | Checks `/status` against real submits and appeals — **unit 9** |
+| `python measure_cost.py` | Ten timed submits; average wall and CPU time per run — **unit 9** |
+| `python check_failure_logging.py` | Sends five failing requests (one a real crash) and checks each was logged — **unit 9**, no server needed |
+| `python run_extension_eval.py` | Criteria 6–10, three trials, each on its own fresh server; writes the run log — **unit 9**. Stop your own `python app.py` first |
 
 ---
 
@@ -234,21 +244,135 @@ your write-up; that's the deliverable.
 
 ---
 
+## Checking a submission's status (unit 9 extension)
+
+`GET /status/<content_id>` answers "where does this submission stand?" It reads
+the audit log and returns the original decision, the current status
+(`decided`, or `under_review` once appealed), and every appeal.
+
+With the service running (`python app.py`), submit something and copy the
+`content_id` from the response:
+
+```bash
+curl -X POST http://127.0.0.1:5000/submit \
+  -H "Content-Type: application/json" \
+  -d '{"text": "<at least 50 words of writing>", "creator_id": "me"}'
+```
+
+Then ask for its status:
+
+```bash
+curl http://127.0.0.1:5000/status/<content_id>
+```
+
+Appeal it and ask again. `status` should now be `under_review` and
+`appeal_count` should be `1`:
+
+```bash
+curl -X POST http://127.0.0.1:5000/appeal \
+  -H "Content-Type: application/json" \
+  -d '{"content_id": "<content_id>", "reasoning": "I wrote this myself."}'
+curl http://127.0.0.1:5000/status/<content_id>
+```
+
+In PowerShell, use `curl.exe` and put each command on one line, as above.
+
+| What you send | What you get |
+|---|---|
+| An ID from a real `/submit` | `200` with `status`, `decision`, `appeal_count`, `appeals` |
+| An ID that was never submitted | `404 unknown_content_id`, logged as `rejected` |
+| An ID longer than 64 characters | `400 invalid_content_id`, logged as `rejected` |
+
+To check all of that in one go, run this with the service up:
+
+```bash
+python run_status_check.py
+```
+
+It submits the 14 texts from the "plain writers" and "label coverage"
+scenarios, appeals them 0, 1 or 2 times, and checks that `/status` reports the
+right status, the right appeal count, and the same scores and label `/submit`
+returned. It then sends two bad IDs and checks they're refused and logged. It
+prints PASS or FAIL per row and writes `results/status_check_<date>.md`. The
+first submission is slow while the model loads; the whole run takes under a
+minute after that.
+
+---
+
+## Instrumentation and cost (unit 9)
+
+Every request writes one record to `logs/runs.jsonl`: timestamp, path, status,
+`outcome` (`ok`, `refused` or `error`), wall and CPU time, a summary of the
+input and output, and for `/submit` the time spent in each signal. Refusals,
+429s and crashes are recorded too. A crash becomes a `500 internal_error` with
+the exception type and line written down. See the last ten records:
+
+```bash
+curl "http://127.0.0.1:5000/runs?limit=10"
+```
+
+Every response carries an `X-Run-Id` header that matches its record's `run_id`.
+
+To check that failures are logged (no server needed):
+
+```bash
+python check_failure_logging.py
+```
+
+You should see `5/5 failures left the right record.`
+
+To measure what a submission costs, restart the service first so the cold
+start is real, then:
+
+```bash
+python app.py            # fresh start, in one terminal
+python measure_cost.py   # in another
+```
+
+It sends ten identical submissions, reads each one's timings back from the run
+log, prints the average, and writes `results/cost_<date>.md`. Expect about
+0.35–0.9 s wall and about 1.7 s CPU per warm run on a laptop, plus 10–30 s
+once for the cold start. It varies a lot on battery power.
+
+To run all five extension criteria (6–10 in `criteria.md`) three times, stop
+any running `python app.py` first, then:
+
+```bash
+python run_extension_eval.py
+```
+
+It starts and stops its own server for each trial, so each trial gets a real
+cold start. It takes about three minutes. It writes
+`results/ext_eval_<date>_trial<N>.md` for each trial and the run log table to
+`results/ext_run_log_<date>.md`.
+
+That server runs with `AI201_FAULT_INJECTION=1`. With that set, a `/submit`
+carrying the header `X-Inject-Fault: style` crashes on purpose inside signal
+two, so the crash path can be tested against the real service. Without the
+variable, the header does nothing. Never set it anywhere else.
+
+---
+
 ## Where everything lives
 
 | File | What it does |
 |---|---|
 | `config.py` | Every setting: thresholds, weights, rate limits, the model |
-| `app.py` | The service. `/ping` and `/log` work; `/submit` and `/appeal` are yours |
+| `app.py` | The service: every route listed above |
 | `detector.py` | Signal one — the local model. Given to you |
-| `stylometry.py` | Signal two. **Stubs — you build these** |
-| `scoring.py` | Combining and labelling. **Stubs — you build these** |
+| `stylometry.py` | Signal two: sentence spread, vocabulary variety, punctuation |
+| `scoring.py` | Combining the two signals and turning the score into a label |
 | `audit.py` | The audit log writer. Given to you |
+| `runlog.py` | The run log: times and records every request, failures included — **unit 9** |
+| `measure_cost.py` | Measures the compute cost of one `/submit` — **unit 9** |
+| `check_failure_logging.py` | Checks that failed requests leave a record — **unit 9** |
 | `run_attacks.py` | Runs the attack set — **unit 8** |
 | `run_eval.py` | Runs your criteria three times — **unit 8** |
+| `run_status_check.py` | Checks `GET /status` end to end — **unit 9** |
 | `scenarios.py` | What your test runs. **You fill this in** |
 | `criteria.md` | Your five criteria. **You write all five** |
 | `logs/audit.jsonl` | Your audit log. **Commit it** |
+| `logs/runs.jsonl` | The run log, one record per request. **Commit it** |
 | `results/` | Attack runs and run logs. **Commit them** |
 
 ---
@@ -279,7 +403,8 @@ sentences, a pasted quotation. That is very cheap to do on purpose.
 
 | What you see | What it means |
 |---|---|
-| `501 not_implemented` | Correct at the start — that's the TODO in `app.py` |
+| `400 text_too_short` | The input gate: `/submit` needs at least 50 words |
+| `500 internal_error` | Something crashed. `curl "http://127.0.0.1:5000/runs?limit=5"` — the record's `error` field names the exception and the line |
 | `404` from curl | Is the server running? Is the path exactly what you typed? |
 | `Cannot bind parameter 'Headers'` | You're in PowerShell, where `curl` is a different tool. Use `curl.exe`, on one line |
 | Request body arrives empty | curl needs `-H "Content-Type: application/json"` |
@@ -288,6 +413,8 @@ sentences, a pasted quotation. That is very cheap to do on purpose.
 | *Every* submission takes 10+ seconds | Something is reloading the model each call. `GET /health` shows `detector_loaded` — if it goes back to `false`, look for a reload in your handler |
 | `DetectorUnavailable` | Run `python detector.py` once to download the model |
 | `/appeal` seems to do nothing | Does the `content_id` you sent actually exist in the log? A typo there fails silently |
+| `/status` returns `404 unknown_content_id` | The ID isn't in the audit log. Copy it from a `/submit` response; if you cleared `logs/audit.jsonl`, older IDs are gone |
+| `run_status_check.py` says `Nothing answering` | Start `python app.py` in another terminal first |
 | Every request gets through, no `429` ever | The decorator is uncommented but limiting is still off. Set `RATE_LIMITING_ENABLED` in `config.py` |
 | Flask-Limiter warns about storage | Shouldn't happen — `storage_uri` is preconfigured. If you changed it, put it back |
 | All three of your labels never appear | Your ranges have a gap. `scoring.label_ranges()` prints them |
